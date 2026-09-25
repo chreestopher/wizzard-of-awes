@@ -196,6 +196,8 @@ async function jsonRequest(url, options) {
   return payload;
 }
 
+let pendingInquiry = null;
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   setStatus("");
@@ -220,33 +222,34 @@ form.addEventListener("submit", async (event) => {
       files: files.map((file) => ({ name: file.name, type: file.type || "application/octet-stream", size: file.size }))
     };
 
-    const prepared = await jsonRequest("/api/inquiries", {
+    const prepared = pendingInquiry || await jsonRequest("/api/inquiries", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(inquiry)
     });
 
-    for (let index = 0; index < files.length; index += 1) {
+    for (let index = 0; !pendingInquiry && index < files.length; index += 1) {
       setStatus(`Uploading file ${index + 1} of ${files.length}…`);
       const upload = prepared.uploads[index];
-      const response = await fetch(upload.url, {
-        method: "PUT",
-        headers: { "content-type": upload.contentType },
-        body: files[index]
-      });
+      const uploadBody = new FormData();
+      Object.entries(upload.fields).forEach(([key, value]) => uploadBody.append(key, value));
+      uploadBody.append("file", files[index]);
+      const response = await fetch(upload.url, { method: "POST", body: uploadBody });
       if (!response.ok) throw new Error(`Could not upload ${files[index].name}.`);
     }
 
     setStatus("Sending your project request…");
-    await jsonRequest(`/api/inquiries/${encodeURIComponent(prepared.inquiryId)}/submit`, {
+    pendingInquiry = prepared;
+    const submitted = await jsonRequest(`/api/inquiries/${encodeURIComponent(prepared.inquiryId)}/submit`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token: prepared.token })
     });
 
+    pendingInquiry = null;
     form.reset();
     fileSummary.textContent = "Images, PDFs, vector files, LightBurn projects, or ZIP archives";
-    setStatus("Your request has been sent. I’ll review it and get back to you by email.", "success");
+    setStatus(submitted.message, "success");
   } catch (error) {
     setStatus(error.message || "Something went wrong. Please try again.", "error");
   } finally {

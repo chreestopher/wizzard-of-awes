@@ -12,11 +12,20 @@ import urllib.parse
 import uuid
 
 from botocore.exceptions import ClientError
+from botocore.config import Config
+import logging
+import time
 
 
 dynamodb = boto3.resource("dynamodb")
 s3 = boto3.client("s3")
-ses = boto3.client("sesv2")
+ses = boto3.client("sesv2", config=Config(
+    retries={"total_max_attempts": 1}, connect_timeout=2, read_timeout=5))
+logger = logging.getLogger(__name__)
+
+
+class RateLimitError(Exception):
+    pass
 table = dynamodb.Table(os.environ["TABLE_NAME"])
 
 UPLOAD_BUCKET = os.environ["UPLOAD_BUCKET"]
@@ -50,7 +59,10 @@ def parse_body(event):
     if event.get("isBase64Encoded"):
         raw = base64.b64decode(raw).decode("utf-8")
     try:
-        return json.loads(raw)
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("The request body must be an object.")
+        return body
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise ValueError("The request body is not valid JSON.")
 
@@ -99,7 +111,7 @@ def enforce_rate_limit(event):
         )
     except ClientError as error:
         if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise PermissionError("Too many requests. Please try again tomorrow.")
+            raise RateLimitError("Too many requests. Please try again tomorrow.")
         raise
 
 
@@ -125,6 +137,8 @@ def create_inquiry(event):
     uploads = []
 
     for index, requested in enumerate(requested_files):
+        if not isinstance(requested, dict):
+            raise ValueError("Invalid file details.")
         filename = safe_filename(requested.get("name"))
         extension = os.path.splitext(filename)[1].lower()
         size = int(requested.get("size") or 0)
@@ -135,13 +149,14 @@ def create_inquiry(event):
             raise ValueError(f"{filename} must be 10 MB or smaller.")
 
         key = f"inquiries/{inquiry_id}/{index + 1:02d}-{filename}"
-        upload_url = s3.generate_presigned_url(
-            "put_object",
-            Params={"Bucket": UPLOAD_BUCKET, "Key": key, "ContentType": content_type},
+        upload = s3.generate_presigned_post(
+            Bucket=UPLOAD_BUCKET, Key=key,
+            Fields={"Content-Type": content_type},
+            Conditions=[{"Content-Type": content_type}, ["content-length-range", size, size]],
             ExpiresIn=900,
         )
         files.append({"name": filename, "key": key, "size": size, "contentType": content_type})
-        uploads.append({"url": upload_url, "contentType": content_type})
+        uploads.append(upload)
 
     now = dt.datetime.now(dt.timezone.utc)
     table.put_item(Item={
@@ -221,7 +236,7 @@ Files submitted through public forms should be treated as untrusted until inspec
 <h2 style="font-size:17px">Private files</h2><ul>{html_files}</ul>
 <p style="color:#666">Links expire in seven days. Treat files submitted through public forms as untrusted until inspected.</p>
 </body></html>"""
-    ses.send_email(
+    return ses.send_email(
         FromEmailAddress=FROM_EMAIL,
         Destination={"ToAddresses": [NOTIFICATION_EMAIL]},
         ReplyToAddresses=[item["email"]],
@@ -235,34 +250,86 @@ Files submitted through public forms should be treated as untrusted until inspec
     )
 
 
+def pending_response():
+    return response(202, {"message": "Your request is saved, but email delivery is not yet confirmed. Please do not submit it again."})
+
+
+def finish_claim(key, claim, status, **fields):
+    names = {"#status": "status"}
+    values = {":sending": "SENDING", ":status": status, ":claim": claim}
+    assignments = ["#status = :status"]
+    for index, (name, value) in enumerate(fields.items()):
+        names[f"#f{index}"] = name
+        values[f":v{index}"] = value
+        assignments.append(f"#f{index} = :v{index}")
+    table.update_item(
+        Key=key, UpdateExpression="SET " + ", ".join(assignments),
+        ConditionExpression="#status = :sending AND claim_id = :claim",
+        ExpressionAttributeNames=names, ExpressionAttributeValues=values)
+
+
 def submit_inquiry(event, inquiry_id):
     body = parse_body(event)
     token = text_value(body.get("token"), "Submission token", 200, required=True)
-    result = table.get_item(Key={"pk": f"INQUIRY#{inquiry_id}"}, ConsistentRead=True)
-    item = result.get("Item")
-    if not item:
+    key = {"pk": f"INQUIRY#{inquiry_id}"}
+    item = table.get_item(Key=key, ConsistentRead=True).get("Item")
+    now = int(time.time())
+    if not item or int(item.get("expires_at", 0)) <= now:
         raise ValueError("This project request could not be found or has expired.")
     supplied_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    if not hmac.compare_digest(supplied_hash, item["token_hash"]):
+    if not hmac.compare_digest(supplied_hash, item.get("token_hash", "")):
         raise PermissionError("This project request could not be verified.")
     if item["status"] == "SUBMITTED":
-        return response(200, {"message": "This project request was already sent."})
+        return response(200, {"message": "Your project request has been sent."})
+    if item["status"] != "DRAFT":
+        # Never reclaim an ambiguous send automatically: SES has no idempotency key.
+        return pending_response()
 
     files = item.get("files") or []
     verify_uploaded_files(files)
     links = file_links(files)
-    send_notification(item, links)
-    table.update_item(
-        Key={"pk": f"INQUIRY#{inquiry_id}"},
-        UpdateExpression="SET #status = :submitted, submitted_at = :submitted_at REMOVE token_hash",
-        ExpressionAttributeNames={"#status": "status"},
-        ExpressionAttributeValues={
-            ":submitted": "SUBMITTED",
-            ":submitted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            ":draft": "DRAFT",
-        },
-        ConditionExpression="#status = :draft",
-    )
+    claim = str(uuid.uuid4())
+    try:
+        table.update_item(
+            Key=key,
+            UpdateExpression="SET #status = :sending, claim_id = :claim, sending_at = :now",
+            ConditionExpression="#status = :draft AND token_hash = :token AND expires_at > :now",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":sending": "SENDING", ":draft": "DRAFT",
+                                       ":claim": claim, ":now": now, ":token": supplied_hash})
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return pending_response()
+        raise
+
+    # Log only identifiers, never customer content or tokens. A claim without a
+    # completion log needs operator review, including a Lambda termination.
+    logger.warning("INQUIRY_SEND_STARTED inquiry=%s claim=%s", inquiry_id, claim)
+    try:
+        sent = send_notification(item, links)
+    except ClientError as error:
+        # Explicit service rejections are safe to retry. Unknown/transport errors
+        # might follow successful acceptance and must not cause another email.
+        code = error.response.get("Error", {}).get("Code")
+        if code in {"MessageRejected", "BadRequestException", "MailFromDomainNotVerifiedException",
+                    "NotFoundException", "AccountSuspendedException", "SendingPausedException",
+                    "TooManyRequestsException", "LimitExceededException", "AccessDeniedException"}:
+            finish_claim(key, claim, "DRAFT")
+            logger.warning("INQUIRY_SEND_REJECTED inquiry=%s claim=%s", inquiry_id, claim)
+            return response(503, {"message": "Email delivery was rejected. Please retry this request later."})
+        logger.error("INQUIRY_SEND_UNCERTAIN inquiry=%s claim=%s", inquiry_id, claim)
+        return pending_response()
+    except Exception:
+        logger.error("INQUIRY_SEND_UNCERTAIN inquiry=%s claim=%s", inquiry_id, claim)
+        return pending_response()
+
+    logger.warning("INQUIRY_SEND_ACCEPTED inquiry=%s claim=%s message=%s", inquiry_id, claim, sent["MessageId"])
+    try:
+        finish_claim(key, claim, "SUBMITTED", submitted_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                     ses_message_id=sent["MessageId"])
+    except Exception:
+        logger.error("INQUIRY_SEND_UNCERTAIN inquiry=%s claim=%s", inquiry_id, claim)
+        return pending_response()
     return response(200, {"message": "Your project request has been sent."})
 
 
@@ -277,6 +344,8 @@ def handler(event, context):
             return submit_inquiry(event, event.get("pathParameters", {}).get("id") or match.group(1))
         return response(404, {"message": "Not found."})
     except PermissionError as error:
+        return response(403, {"message": str(error)})
+    except RateLimitError as error:
         return response(429, {"message": str(error)})
     except ValueError as error:
         return response(400, {"message": str(error)})
