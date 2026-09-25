@@ -1,20 +1,23 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
 const { chromium, firefox, webkit } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 
 (async () => {
   for (const engine of [chromium, firefox, webkit]) {
     const browser = await engine.launch();
+    let server;
     try {
       const page = await browser.newPage();
       let creates = 0, uploads = 0, submits = 0;
-      await page.route('https://example.com/**', async route => {
+      let origin;
+      const handle = async route => {
         const pathname = new URL(route.request().url()).pathname;
         if (pathname === '/api/inquiries') {
           creates++;
           return route.fulfill({ json: { inquiryId: 'test', token: 'test-token', uploads: [{
-            url: 'https://example.com/upload', fields: { policy: 'signed-policy', key: 'test-key', 'Content-Type': 'image/png' }
+            url: origin + '/upload', fields: { policy: 'signed-policy', key: 'test-key', 'Content-Type': 'image/png' }
           }] } });
         }
         if (pathname === '/upload') {
@@ -38,8 +41,25 @@ const { chromium, firefox, webkit } = require(process.env.PLAYWRIGHT_MODULE || '
             contentType: pathname === '/' ? 'text/html' : pathname.endsWith('.js') ? 'application/javascript' : 'text/css' });
         }
         return route.fulfill({ status: 404 });
+      };
+      server = http.createServer(async (request, response) => {
+        try {
+          const chunks = [];
+          for await (const chunk of request) chunks.push(chunk);
+          const body = Buffer.concat(chunks);
+          await handle({
+            request: () => ({ url: () => origin + request.url, method: () => request.method,
+              headers: () => request.headers, postDataBuffer: () => body, postDataJSON: () => JSON.parse(body) }),
+            fulfill: async ({ status = 200, json, body: payload, contentType }) => {
+              response.writeHead(status, { 'Content-Type': json ? 'application/json' : contentType || 'text/plain' });
+              response.end(json ? JSON.stringify(json) : payload);
+            }
+          });
+        } catch (error) { response.writeHead(500).end(); console.error(error); process.exitCode = 1; }
       });
-      await page.goto('https://example.com/');
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      origin = `http://127.0.0.1:${server.address().port}`;
+      await page.goto(origin + '/');
       await page.locator('[name=name]').fill('Test');
       await page.locator('[name=email]').fill('visitor@example.com');
       await page.locator('[name=projectType]').selectOption({ index: 1 });
@@ -51,6 +71,6 @@ const { chromium, firefox, webkit } = require(process.env.PLAYWRIGHT_MODULE || '
       await page.waitForFunction(() => document.querySelector('#form-status').textContent === 'Your request is saved; email delivery is pending.');
       assert.deepEqual({ creates, uploads, submits }, { creates: 1, uploads: 1, submits: 2 });
       console.log(`PASS ${engine.name()}: multipart upload, same-token retry, truthful pending message`);
-    } finally { await browser.close(); }
+    } finally { await browser.close(); if (server) server.close(); }
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });
