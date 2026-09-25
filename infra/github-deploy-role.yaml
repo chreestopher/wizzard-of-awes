@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: GitHub Actions static-site deployment access for Wizzard of Awes
+Description: GitHub Actions application deployment access for Wizzard of Awes
 
 Parameters:
   GitHubOidcSubject:
@@ -10,7 +10,83 @@ Parameters:
   DistributionId:
     Type: String
 
+  ArtifactBucketName:
+    Type: String
+  ProductionStackName:
+    Type: String
+  HostedZoneId:
+    Type: String
+  HttpApiId:
+    Type: String
+
 Resources:
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ManageApplicationStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:*']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProductionStackName}-*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProductionStackName}-*/*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/releases/*'
+              - Effect: Allow
+                Action: ['lambda:*']
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProductionStackName}-*'
+              - Effect: Allow
+                Action: ['dynamodb:*']
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProductionStackName}-*'
+              - Effect: Allow
+                Action: ['logs:*']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ProductionStackName}-*'
+              - Effect: Allow
+                Action: [logs:DescribeLogGroups]
+                Resource: '*'
+              - Effect: Allow
+                Action: [iam:GetRole, iam:CreateRole, iam:DeleteRole, iam:UpdateAssumeRolePolicy, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:GetRolePolicy, iam:ListRolePolicies, iam:ListAttachedRolePolicies, iam:TagRole, iam:UntagRole]
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProductionStackName}-ApiRole-*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProductionStackName}-ApiRole-*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+              - Effect: Allow
+                Action: ['apigateway:*']
+                Resource: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApiId}*'
+              - Effect: Allow
+                Action: [route53:ChangeResourceRecordSets, route53:ListResourceRecordSets, route53:GetHostedZone]
+                Resource: !Sub 'arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}'
+              - Effect: Allow
+                Action: route53:GetChange
+                Resource: !Sub 'arn:${AWS::Partition}:route53:::change/*'
+              - Effect: Allow
+                Action: ['cloudfront:Get*', 'cloudfront:Update*', 'cloudfront:Create*', 'cloudfront:Delete*', 'cloudfront:TagResource', 'cloudfront:UntagResource', 'cloudfront:ListTagsForResource']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DistributionId}'
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:origin-access-control/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:cache-policy/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:origin-request-policy/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:response-headers-policy/*'
+              - Effect: Allow
+                Action: [acm:DescribeCertificate, acm:GetCertificate, acm:ListTagsForCertificate, acm:AddTagsToCertificate, acm:RemoveTagsFromCertificate]
+                Resource: !Sub 'arn:${AWS::Partition}:acm:${AWS::Region}:${AWS::AccountId}:certificate/*'
+              - Effect: Allow
+                Action: [ses:GetEmailIdentity, ses:CreateEmailIdentity, ses:DeleteEmailIdentity, ses:PutEmailIdentityDkimAttributes, ses:TagResource, ses:UntagResource, ses:ListTagsForResource]
+                Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/wizzardofawes.com'
   DeployRole:
     Type: AWS::IAM::Role
     Properties:
@@ -33,6 +109,18 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
+                Action: [cloudformation:CreateChangeSet, cloudformation:DescribeChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DeleteChangeSet, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:GetTemplate]
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProductionStackName}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/releases/*'
+              - Effect: Allow
                 Action: [s3:ListBucket]
                 Resource: !Sub arn:${AWS::Partition}:s3:::${SiteBucketName}
               - Effect: Allow
@@ -45,3 +133,5 @@ Resources:
 Outputs:
   DeployRoleArn:
     Value: !GetAtt DeployRole.Arn
+  CloudFormationRoleArn:
+    Value: !GetAtt CloudFormationRole.Arn

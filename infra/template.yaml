@@ -57,7 +57,7 @@ Resources:
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ['content-type']
-            AllowedMethods: [PUT, HEAD]
+            AllowedMethods: [POST, HEAD]
             AllowedOrigins:
               - !Sub 'https://${DomainName}'
               - !Sub 'https://www.${DomainName}'
@@ -124,7 +124,7 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub '${ApiLogGroup.Arn}:*'
+                Resource: !GetAtt ApiLogGroup.Arn
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -138,11 +138,21 @@ Resources:
                 Resource: !Sub '${UploadBucket.Arn}/inquiries/*'
               - Effect: Allow
                 Action: ses:SendEmail
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}'
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Sub 'inquiries@${DomainName}'
+                  ForAllValues:StringEquals:
+                    ses:Recipients: [!Ref NotificationEmail]
+                  'Null':
+                    ses:Recipients: 'false'
+
 
   ApiFunction:
     Type: AWS::Lambda::Function
     Properties:
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
       Runtime: python3.12
       Handler: api.handler
       Role: !GetAtt ApiRole.Arn
