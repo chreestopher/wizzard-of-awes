@@ -39,6 +39,7 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_DAILY_REQUESTS_PER_IP = 10
 MAX_PROJECT_FILE_BYTES = 250 * 1024 * 1024
 MAX_PROJECT_GRANT_FILES = 25
+MAX_PROJECT_LIST_FILES = 200
 MAX_PROJECT_ACCESS_ATTEMPTS_PER_DAY = 20
 PROJECT_ACCESS_TOKEN_SECONDS = 60 * 60
 ALLOWED_EXTENSIONS = {
@@ -242,6 +243,84 @@ def create_project_upload_grants(event):
     return response(201, {"projectPrefix": prefix, "files": grants})
 
 
+def project_file_request(event, require_key=False):
+    if not project_upload_enabled():
+        raise ValueError("Project uploads are not configured yet.")
+    body = parse_body(event)
+    token = text_value(body.get("accessToken"), "Access token", 2000, required=True)
+    decode_project_access_token(token)
+    prefix = project_prefix(body.get("projectName"))
+    key = None
+    if require_key:
+        key = text_value(body.get("key"), "File key", 1024, required=True)
+        pattern = re.escape(prefix) + r"/\d{8}T\d{6}Z-[0-9a-f]{12}-[^/]{1,120}"
+        if not re.fullmatch(pattern, key):
+            raise PermissionError("That file does not belong to this project.")
+    return body, prefix, key
+
+
+def project_file_name(key):
+    stored_name = key.rsplit("/", 1)[-1]
+    match = re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{12}-(.+)", stored_name)
+    return match.group(1) if match else stored_name
+
+
+def list_project_files(event):
+    body, prefix, _ = project_file_request(event)
+    continuation = text_value(body.get("continuationToken"), "Continuation token", 4096)
+    request = {
+        "Bucket": PROJECT_UPLOAD_BUCKET,
+        "Prefix": prefix + "/",
+        "MaxKeys": MAX_PROJECT_LIST_FILES,
+    }
+    if continuation:
+        request["ContinuationToken"] = continuation
+    result = s3.list_objects_v2(**request)
+    files = [{
+        "key": item["Key"],
+        "name": project_file_name(item["Key"]),
+        "size": int(item.get("Size", 0)),
+        "lastModified": item["LastModified"].isoformat(),
+    } for item in result.get("Contents", [])]
+    return response(200, {
+        "files": files,
+        "nextToken": result.get("NextContinuationToken") if result.get("IsTruncated") else None,
+    })
+
+
+def create_project_download(event):
+    _, _, key = project_file_request(event, require_key=True)
+    try:
+        s3.head_object(Bucket=PROJECT_UPLOAD_BUCKET, Key=key)
+    except ClientError as error:
+        if error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404 or error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            raise ValueError("That file no longer exists.")
+        raise
+    name = project_file_name(key)
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": PROJECT_UPLOAD_BUCKET,
+            "Key": key,
+            "ResponseContentDisposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(name)}",
+        },
+        ExpiresIn=900,
+    )
+    return response(200, {"url": url, "expiresIn": 900})
+
+
+def delete_project_file(event):
+    _, _, key = project_file_request(event, require_key=True)
+    try:
+        s3.head_object(Bucket=PROJECT_UPLOAD_BUCKET, Key=key)
+    except ClientError as error:
+        if error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404 or error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            raise ValueError("That file no longer exists.")
+        raise
+    s3.delete_object(Bucket=PROJECT_UPLOAD_BUCKET, Key=key)
+    return response(200, {"message": f"Deleted {project_file_name(key)}."})
+
+
 def create_inquiry(event):
     enforce_rate_limit(event)
     body = parse_body(event)
@@ -377,6 +456,90 @@ Files submitted through public forms should be treated as untrusted until inspec
     )
 
 
+def send_project_file_notification(action, project, name, size=None):
+    verb = "uploaded" if action == "uploaded" else "deleted"
+    size_line = f"\nSize: {int(size):,} bytes" if size is not None else ""
+    plain = f"""A Wizzard of Awes project file was {verb}.
+
+Project: {project}
+File: {name}{size_line}
+
+Manage project files at {ALLOWED_ORIGIN}/project_upload
+"""
+    size_html = f"<br><strong>Size:</strong> {int(size):,} bytes" if size is not None else ""
+    html_body = f"""<!doctype html><html><body style="font-family:Arial,sans-serif;line-height:1.55;color:#17191b">
+<h1 style="font-size:22px">Project file {verb}</h1>
+<p><strong>Project:</strong> {html.escape(project)}<br>
+<strong>File:</strong> {html.escape(name)}{size_html}</p>
+<p><a href="{html.escape(ALLOWED_ORIGIN, quote=True)}/project_upload">Manage project files</a></p>
+</body></html>"""
+    return ses.send_email(
+        FromEmailAddress=FROM_EMAIL,
+        Destination={"ToAddresses": [NOTIFICATION_EMAIL]},
+        Content={"Simple": {
+            "Subject": {"Data": f"Project file {verb}: {project}", "Charset": "UTF-8"},
+            "Body": {
+                "Text": {"Data": plain, "Charset": "UTF-8"},
+                "Html": {"Data": html_body, "Charset": "UTF-8"},
+            },
+        }},
+    )
+
+
+def handle_project_storage_event(event):
+    detail_type = event.get("detail-type")
+    if detail_type not in {"Object Created", "Object Deleted"}:
+        return {"ignored": True}
+    detail = event.get("detail") or {}
+    object_detail = detail.get("object") or {}
+    key = urllib.parse.unquote_plus(str(object_detail.get("key") or ""))
+    match = re.fullmatch(r"projects/([^/]+)/(.+)", key)
+    event_id = text_value(event.get("id"), "Event ID", 200, required=True)
+    if not match:
+        return {"ignored": True}
+
+    claim_key = {"pk": f"PROJECTEVENT#{event_id}"}
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        table.put_item(
+            Item={
+                **claim_key,
+                "status": "SENDING",
+                "created_at": now.isoformat(),
+                "expires_at": int((now + dt.timedelta(days=7)).timestamp()),
+            },
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {"duplicate": True}
+        raise
+
+    action = "uploaded" if detail_type == "Object Created" else "deleted"
+    project = match.group(1)
+    name = project_file_name(key)
+    size = object_detail.get("size") if action == "uploaded" else None
+    try:
+        sent = send_project_file_notification(action, project, name, size)
+    except ClientError:
+        table.delete_item(Key=claim_key)
+        raise
+    except Exception:
+        logger.exception("PROJECT_FILE_EMAIL_UNCERTAIN event=%s action=%s", event_id, action)
+        return {"uncertain": True}
+
+    try:
+        table.update_item(
+            Key=claim_key,
+            UpdateExpression="SET #status = :sent, ses_message_id = :message",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":sent": "SENT", ":message": sent["MessageId"]},
+        )
+    except Exception:
+        logger.exception("PROJECT_FILE_EMAIL_RECORDED_UNCERTAIN event=%s action=%s", event_id, action)
+    return {"notified": True}
+
+
 def pending_response():
     return response(202, {"message": "Your request is saved, but email delivery is not yet confirmed. Please do not submit it again."})
 
@@ -462,6 +625,8 @@ def submit_inquiry(event, inquiry_id):
 
 def handler(event, context):
     del context
+    if event.get("source") == "aws.s3":
+        return handle_project_storage_event(event)
     try:
         route_key = event.get("routeKey", "")
         if route_key == "POST /api/inquiries":
@@ -470,6 +635,12 @@ def handler(event, context):
             return authorize_project_upload(event)
         if route_key == "POST /api/project-upload/grants":
             return create_project_upload_grants(event)
+        if route_key == "POST /api/project-upload/files":
+            return list_project_files(event)
+        if route_key == "POST /api/project-upload/download":
+            return create_project_download(event)
+        if route_key == "POST /api/project-upload/delete":
+            return delete_project_file(event)
         match = re.fullmatch(r"POST /api/inquiries/([^/]+)/submit", route_key)
         if match:
             return submit_inquiry(event, event.get("pathParameters", {}).get("id") or match.group(1))

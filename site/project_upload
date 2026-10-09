@@ -57,6 +57,18 @@
           <button id="upload-button" class="submit-button" type="submit">Upload files</button>
           <p id="upload-status" class="form-status" role="status" aria-live="polite"></p>
           <ol id="upload-results" class="upload-results" aria-label="Upload progress"></ol>
+
+          <section class="project-browser" aria-labelledby="project-files-title">
+            <div class="project-browser-heading">
+              <div>
+                <p class="eyebrow">Stored project files</p>
+                <h2 id="project-files-title">Files in this project</h2>
+              </div>
+              <button id="refresh-project-files" class="secondary-button" type="button">Show files</button>
+            </div>
+            <p id="project-files-status" class="form-status" role="status" aria-live="polite">Enter a project name, then show its saved files.</p>
+            <ul id="project-file-list" class="project-file-list" aria-label="Saved project files"></ul>
+          </section>
         </form>
       </section>
     </main>

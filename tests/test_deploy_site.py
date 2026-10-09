@@ -36,10 +36,15 @@ class DeployTests(unittest.TestCase):
 
     def test_project_upload_page_has_external_script_and_unlimited_picker(self):
         page = (root / 'site' / 'project_upload').read_text(encoding='utf-8')
+        script = (root / 'site' / 'project-upload.js').read_text(encoding='utf-8')
         self.assertIn('src="/project-upload.js"', page)
         self.assertNotIn('<script>', page)
         self.assertIn('type="file" multiple', page)
         self.assertIn('up to 250 MiB per file', page)
+        self.assertIn('id="project-file-list"', page)
+        self.assertIn('/api/project-upload/files', script)
+        self.assertIn('/api/project-upload/download', script)
+        self.assertIn('/api/project-upload/delete', script)
 
     def test_failed_upload_stops_deployment(self):
         with patch.object(deploy, 'aws', side_effect=subprocess.CalledProcessError(1, 'aws')) as aws, patch.object(deploy, 'urlopen') as live:

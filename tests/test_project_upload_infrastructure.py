@@ -29,6 +29,17 @@ class ProjectUploadInfrastructureTests(unittest.TestCase):
         self.assertIn("NoEcho: true", parameter)
         self.assertIn("POST /api/project-upload/access", self.template)
         self.assertIn("POST /api/project-upload/grants", self.template)
+        self.assertIn("POST /api/project-upload/files", self.template)
+        self.assertIn("POST /api/project-upload/download", self.template)
+        self.assertIn("POST /api/project-upload/delete", self.template)
+
+    def test_storage_events_and_file_management_permissions_are_declared(self):
+        self.assertIn("EventBridgeEnabled: true", self.template)
+        self.assertIn("detail-type: [Object Created, Object Deleted]", self.template)
+        self.assertIn("Principal: events.amazonaws.com", self.template)
+        self.assertIn("- s3:GetObject", self.template)
+        self.assertIn("- s3:DeleteObject", self.template)
+        self.assertIn("Action: s3:ListBucket", self.template)
 
 
 if __name__ == "__main__":

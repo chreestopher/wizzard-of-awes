@@ -87,7 +87,10 @@ may be at most 250 MiB, there is no application-level file-count limit, and comp
 files have no expiration lifecycle. A project name maps to an S3 prefix; later
 uploads with the same name receive unique object keys under that prefix, so they
 append without replacing earlier files. New names begin a new prefix when their
-first file is uploaded. Files remain until an administrator deletes them from S3.
+first file is uploaded. After unlocking the portal, users can list the files for a
+project, download them through short-lived private links, or permanently delete
+them. S3 object-created and object-deleted events send duplicate-resistant email
+notifications to the configured notification address.
 The access code is verified by Lambda, never shipped to the browser, and successful
 verification produces a one-hour in-memory token. Upload grants last 15 minutes and
 bind the exact declared content length and content type.
