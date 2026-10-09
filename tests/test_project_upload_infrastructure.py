@@ -41,6 +41,15 @@ class ProjectUploadInfrastructureTests(unittest.TestCase):
         self.assertIn("- s3:DeleteObject", self.template)
         self.assertIn("Action: s3:ListBucket", self.template)
 
+    def test_cloudformation_role_can_manage_project_event_rule(self):
+        bootstrap = (Path(__file__).resolve().parents[1] / "infra/github-deploy-role.yaml").read_text(encoding="utf-8")
+        self.assertIn("events:DescribeRule", bootstrap)
+        self.assertIn("events:PutRule", bootstrap)
+        self.assertIn("events:PutTargets", bootstrap)
+        self.assertIn("events:RemoveTargets", bootstrap)
+        self.assertIn("events:DeleteRule", bootstrap)
+        self.assertIn("rule/${ProductionStackName}-*", bootstrap)
+
 
 if __name__ == "__main__":
     unittest.main()
