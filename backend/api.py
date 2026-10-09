@@ -153,6 +153,9 @@ def decode_project_access_token(token):
         encoded_text, signature_text = str(token or "").split(".", 1)
         encoded = encoded_text.encode("ascii")
         signature = base64.urlsafe_b64decode(signature_text + "=" * (-len(signature_text) % 4))
+        canonical_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+        if not hmac.compare_digest(signature_text, canonical_signature):
+            raise PermissionError("Project upload access has expired. Enter the access code again.")
         expected = hmac.new(token_key(), encoded, hashlib.sha256).digest()
         if not hmac.compare_digest(signature, expected):
             raise PermissionError("Project upload access has expired. Enter the access code again.")
