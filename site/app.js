@@ -6,6 +6,50 @@ const submitButton = form.querySelector("button[type='submit']");
 
 document.querySelector("#year").textContent = String(new Date().getFullYear());
 
+function scrollToPageFragment(hash = window.location.hash) {
+  if (!hash || hash === "#") return false;
+  let id;
+  try {
+    id = decodeURIComponent(hash.slice(1));
+  } catch {
+    return false;
+  }
+  const target = document.getElementById(id);
+  if (!target) return false;
+  target.scrollIntoView({ behavior: "auto", block: "start" });
+  return true;
+}
+
+function settlePageFragment(hash) {
+  scrollToPageFragment(hash);
+  requestAnimationFrame(() => requestAnimationFrame(() => scrollToPageFragment(hash)));
+}
+
+// Native fragment scrolling can retain an old position when the same hash is
+// clicked again, or drift while media above the target finishes layout. Own
+// same-page anchor navigation so every click lands at the section boundary.
+document.addEventListener("click", (event) => {
+  const link = event.target.closest("a[href^='#']");
+  if (!link) return;
+  const destination = new URL(link.href, window.location.href);
+  if (
+    destination.origin !== window.location.origin ||
+    destination.pathname !== window.location.pathname ||
+    destination.search !== window.location.search ||
+    !document.getElementById(decodeURIComponent(destination.hash.slice(1)))
+  ) return;
+  event.preventDefault();
+  if (window.location.hash !== destination.hash) {
+    history.pushState(null, "", destination.hash);
+  }
+  settlePageFragment(destination.hash);
+});
+
+window.addEventListener("hashchange", () => settlePageFragment(window.location.hash));
+window.addEventListener("load", () => {
+  if (window.location.hash) settlePageFragment(window.location.hash);
+});
+
 const fullscreenMedia = document.querySelectorAll(
   ".work-card-media--duo picture, .work-card > .work-card-media:not(.work-card-media--duo), .pen-item picture, .woodwork-item picture, .gallery-media"
 );
