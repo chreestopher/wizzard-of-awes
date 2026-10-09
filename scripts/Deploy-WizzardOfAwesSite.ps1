@@ -4,7 +4,9 @@ param(
     [string]$Region = 'us-east-1',
     [string]$DomainName = 'wizzardofawes.com',
     [string]$StackName = 'wizzard-of-awes-production',
-    [string]$NotificationEmail
+    [string]$NotificationEmail,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$ProjectUploadCodeHash
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,17 +67,21 @@ $artifactKey = "releases/$((Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss
 & aws s3 cp $lambdaZip "s3://$artifactBucket/$artifactKey" --only-show-errors --profile $Profile --region $Region
 if ($LASTEXITCODE -ne 0) { throw 'Could not upload the Lambda artifact.' }
 
+$parameterOverrides = @(
+    "DomainName=$DomainName",
+    "HostedZoneId=$hostedZoneId",
+    "NotificationEmail=$NotificationEmail",
+    "LambdaArtifactBucket=$artifactBucket",
+    "LambdaArtifactKey=$artifactKey"
+)
+if ($ProjectUploadCodeHash) { $parameterOverrides += "ProjectUploadCodeHash=$($ProjectUploadCodeHash.ToLowerInvariant())" }
+
 & aws cloudformation deploy `
     --stack-name $StackName `
     --template-file (Join-Path $projectRoot 'infra\template.yaml') `
     --capabilities CAPABILITY_NAMED_IAM `
     --no-fail-on-empty-changeset `
-    --parameter-overrides `
-        "DomainName=$DomainName" `
-        "HostedZoneId=$hostedZoneId" `
-        "NotificationEmail=$NotificationEmail" `
-        "LambdaArtifactBucket=$artifactBucket" `
-        "LambdaArtifactKey=$artifactKey" `
+    --parameter-overrides $parameterOverrides `
     --profile $Profile `
     --region $Region
 if ($LASTEXITCODE -ne 0) { throw 'CloudFormation deployment failed.' }
@@ -88,8 +94,16 @@ foreach ($item in $outputs.Stacks[0].Outputs) { $outputMap[$item.OutputKey] = $i
 if ($LASTEXITCODE -ne 0) { throw 'Static site upload failed.' }
 # Sync does not update metadata for unchanged files. Revalidate the entry point
 # and application code on every visit, including after a metadata-only release.
-foreach ($entryFile in @('index.html', 'app.js', 'styles.css')) {
-    & aws s3 cp (Join-Path $projectRoot "site\$entryFile") "s3://$($outputMap.SiteBucketName)/$entryFile" --cache-control 'no-cache' --only-show-errors --profile $Profile --region $Region
+$entryFiles = [ordered]@{
+    'app.js' = 'application/javascript'
+    'styles.css' = 'text/css'
+    'project-upload.js' = 'application/javascript'
+    'project-upload.css' = 'text/css'
+    'index.html' = 'text/html'
+    'project_upload' = 'text/html'
+}
+foreach ($entryFile in $entryFiles.Keys) {
+    & aws s3 cp (Join-Path $projectRoot "site\$entryFile") "s3://$($outputMap.SiteBucketName)/$entryFile" --content-type $entryFiles[$entryFile] --cache-control 'no-cache' --only-show-errors --profile $Profile --region $Region
     if ($LASTEXITCODE -ne 0) { throw "Could not publish cache policy for $entryFile." }
 }
 & aws cloudfront create-invalidation --distribution-id $outputMap.DistributionId --paths '/*' --profile $Profile | Out-Null

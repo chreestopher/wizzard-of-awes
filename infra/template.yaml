@@ -10,6 +10,11 @@ Parameters:
   NotificationEmail:
     Type: String
     NoEcho: true
+  ProjectUploadCodeHash:
+    Type: String
+    NoEcho: true
+    Default: disabled
+    Description: SHA-256 hex digest of the shared project-upload access code
   LambdaArtifactBucket:
     Type: String
   LambdaArtifactKey:
@@ -82,6 +87,48 @@ Resources:
               Bool:
                 aws:SecureTransport: false
 
+  ProjectUploadBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['content-type']
+            AllowedMethods: [POST, HEAD]
+            AllowedOrigins:
+              - !Sub 'https://${DomainName}'
+              - !Sub 'https://www.${DomainName}'
+            ExposedHeaders: [etag]
+            MaxAge: 900
+
+  ProjectUploadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProjectUploadBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ProjectUploadBucket.Arn
+              - !Sub '${ProjectUploadBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
   InquiryTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -137,6 +184,9 @@ Resources:
                   - s3:PutObject
                 Resource: !Sub '${UploadBucket.Arn}/inquiries/*'
               - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ProjectUploadBucket.Arn}/projects/*'
+              - Effect: Allow
                 Action: ses:SendEmail
                 Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}'
                 Condition:
@@ -165,6 +215,8 @@ Resources:
         Variables:
           TABLE_NAME: !Ref InquiryTable
           UPLOAD_BUCKET: !Ref UploadBucket
+          PROJECT_UPLOAD_BUCKET: !Ref ProjectUploadBucket
+          PROJECT_UPLOAD_CODE_HASH: !Ref ProjectUploadCodeHash
           NOTIFICATION_EMAIL: !Ref NotificationEmail
           FROM_EMAIL: !Sub 'inquiries@${DomainName}'
           ALLOWED_ORIGIN: !Sub 'https://${DomainName}'
@@ -204,6 +256,20 @@ Resources:
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: 'POST /api/inquiries/{id}/submit'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ProjectUploadAccessRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/project-upload/access'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ProjectUploadGrantsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/project-upload/grants'
       Target: !Sub 'integrations/${ApiIntegration}'
 
   ApiStage:
@@ -455,6 +521,8 @@ Outputs:
     Value: !Ref SiteBucket
   UploadBucketName:
     Value: !Ref UploadBucket
+  ProjectUploadBucketName:
+    Value: !Ref ProjectUploadBucket
   DistributionId:
     Value: !Ref Distribution
   DistributionDomainName:

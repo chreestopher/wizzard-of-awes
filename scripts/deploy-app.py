@@ -32,6 +32,17 @@ def deploy_backend(cf, s3):
         for name in ("DomainName", "HostedZoneId", "NotificationEmail")
     ] + [{"ParameterKey": "LambdaArtifactBucket", "ParameterValue": bucket},
          {"ParameterKey": "LambdaArtifactKey", "ParameterValue": key}]
+    code_hash = os.environ.get("PROJECT_UPLOAD_CODE_HASH", "").strip()
+    existing_parameters = {
+        item["ParameterKey"]
+        for item in cf.describe_stacks(StackName=stack)["Stacks"][0].get("Parameters", [])
+    }
+    if code_hash:
+        if len(code_hash) != 64 or any(character not in "0123456789abcdefABCDEF" for character in code_hash):
+            raise ValueError("PROJECT_UPLOAD_CODE_HASH must be a 64-character SHA-256 hex digest.")
+        parameters.append({"ParameterKey": "ProjectUploadCodeHash", "ParameterValue": code_hash.lower()})
+    elif "ProjectUploadCodeHash" in existing_parameters:
+        parameters.append({"ParameterKey": "ProjectUploadCodeHash", "UsePreviousValue": True})
     change = cf.create_change_set(
         StackName=stack, ChangeSetName=f"release-{time.time_ns()}", ChangeSetType="UPDATE",
         TemplateBody=(ROOT / "infra/template.yaml").read_text(encoding="utf-8"),

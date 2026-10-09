@@ -14,5 +14,5 @@ jobs:
           persist-credentials: false
       - run: python3 -m pip install -r tests/requirements.txt
       - run: cfn-lint infra/template.yaml infra/github-deploy-role.yaml
-      - run: node --check site/app.js
+      - run: node --check site/app.js && node --check site/project-upload.js
       - run: python3 -m unittest discover -s tests

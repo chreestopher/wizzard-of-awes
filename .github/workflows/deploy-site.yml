@@ -67,13 +67,14 @@ jobs:
       ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
       CLOUDFORMATION_ROLE_ARN: ${{ vars.CLOUDFORMATION_ROLE_ARN }}
       SITE_URL: https://wizzardofawes.com
+      PROJECT_UPLOAD_CODE_HASH: ${{ secrets.PROJECT_UPLOAD_CODE_HASH }}
     steps:
       - name: Check out the merged commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Check application syntax
-        run: node --check site/app.js
+        run: node --check site/app.js && node --check site/project-upload.js
       - name: Install backend test dependencies
         run: python3 -m pip install -r tests/requirements.txt
       - name: Check backend security and deployment failure handling

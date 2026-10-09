@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Private project file upload portal for Wizzard of Awes." />
+    <meta name="theme-color" content="#090b0d" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Project Upload — Wizzard of Awes</title>
+    <link rel="icon" href="/assets/wizardlogo.png" />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/project-upload.css" />
+    <script defer src="/project-upload.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Wizzard of Awes home">
+        <img src="/assets/wizardlogo.png" alt="" />
+        <span>Wizzard of Awes</span>
+      </a>
+      <nav aria-label="Project upload navigation">
+        <a href="/">Return to website</a>
+      </nav>
+    </header>
+
+    <main class="upload-page">
+      <section class="upload-intro" aria-labelledby="upload-title">
+        <p class="eyebrow">Private file transfer</p>
+        <h1 id="upload-title">Project upload</h1>
+        <p>Use the access code you were given, choose a project name, and send one or more files directly to private storage.</p>
+      </section>
+
+      <section class="upload-panel" aria-label="Project file upload">
+        <form id="access-form" class="upload-form">
+          <label for="access-code">Access code
+            <input id="access-code" name="code" type="password" required autocomplete="one-time-code" maxlength="200" />
+          </label>
+          <button id="access-button" class="submit-button" type="submit">Continue</button>
+          <p id="access-status" class="form-status" role="status" aria-live="polite"></p>
+        </form>
+
+        <form id="project-upload-form" class="upload-form" hidden>
+          <label for="project-name">Project name
+            <input id="project-name" name="projectName" type="text" required maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9 ._-]*" autocomplete="off" />
+            <em>Use the same project name later to add more files to that project.</em>
+          </label>
+
+          <label class="file-field" for="project-files">Files
+            <input id="project-files" name="files" type="file" multiple required />
+            <span class="file-picker">
+              <strong>Choose files</strong>
+              <small>Any file type · up to 250 MiB per file · no file-count limit</small>
+            </span>
+          </label>
+
+          <div id="selected-files" class="selected-files" aria-live="polite"></div>
+          <button id="upload-button" class="submit-button" type="submit">Upload files</button>
+          <p id="upload-status" class="form-status" role="status" aria-live="polite"></p>
+          <ol id="upload-results" class="upload-results" aria-label="Upload progress"></ol>
+        </form>
+      </section>
+    </main>
+
+    <footer>
+      <a class="brand brand--footer" href="/">
+        <img src="/assets/wizardlogo.png" alt="" />
+        <span>Wizzard of Awes</span>
+      </a>
+      <span>Private project uploads</span>
+    </footer>
+  </body>
+</html>
