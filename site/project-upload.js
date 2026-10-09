@@ -13,6 +13,9 @@
   const uploadButton = document.querySelector("#upload-button");
   const uploadStatus = document.querySelector("#upload-status");
   const uploadResults = document.querySelector("#upload-results");
+  const refreshProjectFiles = document.querySelector("#refresh-project-files");
+  const projectFilesStatus = document.querySelector("#project-files-status");
+  const projectFileList = document.querySelector("#project-file-list");
   let accessToken = "";
 
   function setStatus(element, message, state = "") {
@@ -44,6 +47,20 @@
 
   function chosenFiles() {
     return Array.from(fileInput.files || []);
+  }
+
+  function projectRequest(extra = {}) {
+    if (!projectName.reportValidity()) throw new Error("Enter a valid project name first.");
+    return { accessToken, projectName: projectName.value, ...extra };
+  }
+
+  function handleExpiredAccess(error) {
+    if (!/access has expired/i.test(error.message)) return false;
+    accessToken = "";
+    uploadForm.hidden = true;
+    accessForm.hidden = false;
+    accessCode.focus();
+    return true;
   }
 
   function showSelection() {
@@ -106,6 +123,103 @@
     });
   }
 
+  function fileRow(file) {
+    const row = document.createElement("li");
+    row.className = "project-file";
+
+    const name = document.createElement("span");
+    name.className = "project-file-name";
+    name.textContent = file.name;
+
+    const meta = document.createElement("span");
+    meta.className = "project-file-meta";
+    const saved = new Date(file.lastModified);
+    meta.textContent = `${readableSize(file.size)} · ${Number.isNaN(saved.valueOf()) ? "Saved" : saved.toLocaleString()}`;
+
+    const actions = document.createElement("span");
+    actions.className = "project-file-actions";
+    const download = document.createElement("button");
+    download.type = "button";
+    download.className = "file-action";
+    download.textContent = "Download";
+    download.addEventListener("click", async () => {
+      download.disabled = true;
+      setStatus(projectFilesStatus, `Preparing ${file.name}…`);
+      try {
+        const result = await api("/api/project-upload/download", projectRequest({ key: file.key }));
+        const link = document.createElement("a");
+        link.href = result.url;
+        link.rel = "noopener";
+        link.download = file.name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setStatus(projectFilesStatus, `Download started for ${file.name}.`, "success");
+      } catch (error) {
+        setStatus(projectFilesStatus, error.message, "error");
+        handleExpiredAccess(error);
+      } finally {
+        download.disabled = false;
+      }
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "file-action file-action--delete";
+    remove.textContent = "Delete";
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`Permanently delete ${file.name} from ${projectName.value}?`)) return;
+      remove.disabled = true;
+      download.disabled = true;
+      setStatus(projectFilesStatus, `Deleting ${file.name}…`);
+      try {
+        const result = await api("/api/project-upload/delete", projectRequest({ key: file.key }));
+        row.remove();
+        setStatus(projectFilesStatus, result.message, "success");
+        if (!projectFileList.children.length) {
+          setStatus(projectFilesStatus, "This project has no saved files.");
+        }
+      } catch (error) {
+        setStatus(projectFilesStatus, error.message, "error");
+        handleExpiredAccess(error);
+        remove.disabled = false;
+        download.disabled = false;
+      }
+    });
+
+    actions.append(download, remove);
+    row.append(name, meta, actions);
+    return row;
+  }
+
+  async function loadProjectFiles() {
+    refreshProjectFiles.disabled = true;
+    projectFileList.replaceChildren();
+    setStatus(projectFilesStatus, "Loading saved files…");
+    try {
+      const files = [];
+      let continuationToken = "";
+      do {
+        const result = await api("/api/project-upload/files", projectRequest({ continuationToken }));
+        files.push(...result.files);
+        continuationToken = result.nextToken || "";
+        if (continuationToken) setStatus(projectFilesStatus, `Loading saved files… ${files.length} found`);
+      } while (continuationToken);
+      files.sort((left, right) => String(right.lastModified).localeCompare(String(left.lastModified)));
+      projectFileList.append(...files.map(fileRow));
+      setStatus(
+        projectFilesStatus,
+        files.length ? `${files.length} saved file${files.length === 1 ? "" : "s"}.` : "This project has no saved files.",
+        files.length ? "success" : "",
+      );
+    } catch (error) {
+      setStatus(projectFilesStatus, error.message, "error");
+      handleExpiredAccess(error);
+    } finally {
+      refreshProjectFiles.disabled = false;
+    }
+  }
+
   accessForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     accessButton.disabled = true;
@@ -126,6 +240,11 @@
   });
 
   fileInput.addEventListener("change", showSelection);
+  refreshProjectFiles.addEventListener("click", loadProjectFiles);
+  projectName.addEventListener("input", () => {
+    projectFileList.replaceChildren();
+    setStatus(projectFilesStatus, "Show files to view this project's saved files.");
+  });
 
   uploadForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -163,6 +282,7 @@
       setStatus(uploadStatus, `${completed} file${completed === 1 ? "" : "s"} added to this project.`, "success");
       fileInput.value = "";
       showSelection();
+      await loadProjectFiles();
     } catch (error) {
       const display = displays[completed];
       if (display) {
@@ -170,12 +290,7 @@
         display.row.dataset.state = "error";
       }
       setStatus(uploadStatus, `${error.message} Files already marked complete were saved; select only the remaining files before retrying.`, "error");
-      if (/access has expired/i.test(error.message)) {
-        accessToken = "";
-        uploadForm.hidden = true;
-        accessForm.hidden = false;
-        accessCode.focus();
-      }
+      handleExpiredAccess(error);
     } finally {
       uploadButton.disabled = false;
       fileInput.disabled = false;

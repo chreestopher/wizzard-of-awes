@@ -101,6 +101,9 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ['content-type']
@@ -177,6 +180,7 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
                 Resource: !GetAtt InquiryTable.Arn
               - Effect: Allow
                 Action:
@@ -184,8 +188,17 @@ Resources:
                   - s3:PutObject
                 Resource: !Sub '${UploadBucket.Arn}/inquiries/*'
               - Effect: Allow
-                Action: s3:PutObject
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
                 Resource: !Sub '${ProjectUploadBucket.Arn}/projects/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ProjectUploadBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: 'projects/*'
               - Effect: Allow
                 Action: ses:SendEmail
                 Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}'
@@ -272,6 +285,27 @@ Resources:
       RouteKey: 'POST /api/project-upload/grants'
       Target: !Sub 'integrations/${ApiIntegration}'
 
+  ProjectUploadFilesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/project-upload/files'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ProjectUploadDownloadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/project-upload/download'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ProjectUploadDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/project-upload/delete'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
   ApiStage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
@@ -293,6 +327,30 @@ Resources:
       FunctionName: !Ref ApiFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  ProjectUploadEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created, Object Deleted]
+        detail:
+          bucket:
+            name: [!Ref ProjectUploadBucket]
+          object:
+            key:
+              - prefix: projects/
+      Targets:
+        - Arn: !GetAtt ApiFunction.Arn
+          Id: ProjectUploadNotification
+
+  ProjectUploadEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProjectUploadEventRule.Arn
 
   Certificate:
     Type: AWS::CertificateManager::Certificate

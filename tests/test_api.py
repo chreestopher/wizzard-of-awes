@@ -35,6 +35,7 @@ class ApiTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("api", Path(__file__).resolve().parents[1] / "backend/api.py")
         self.api = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.api)
+        self.api.s3.create_bucket(Bucket="test-project-uploads")
 
     def create(self, files=None):
         result = self.api.create_inquiry({"body": json.dumps({
@@ -62,6 +63,13 @@ class ApiTests(unittest.TestCase):
         result = self.api.handler({
             "routeKey": "POST /api/project-upload/grants",
             "body": json.dumps({"accessToken": token, "projectName": name, "files": files}),
+        }, None)
+        return result, json.loads(result["body"])
+
+    def project_file_action(self, route, token, name="Customer Project", **fields):
+        result = self.api.handler({
+            "routeKey": f"POST /api/project-upload/{route}",
+            "body": json.dumps({"accessToken": token, "projectName": name, **fields}),
         }, None)
         return result, json.loads(result["body"])
 
@@ -198,3 +206,49 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(payload["files"]), self.api.MAX_PROJECT_GRANT_FILES)
         result, _ = self.project_grants(access["accessToken"], files + [{"name": "one-more", "size": 1}])
         self.assertEqual(result["statusCode"], 400)
+
+    def test_project_files_can_be_listed_downloaded_and_deleted(self):
+        _, access = self.project_access()
+        token = access["accessToken"]
+        key = "projects/Customer Project/20261009T120000Z-abcdef123456-artwork.psd"
+        other = "projects/Other Project/20261009T120000Z-abcdef123456-private.psd"
+        self.api.s3.put_object(Bucket="test-project-uploads", Key=key, Body=b"artwork")
+        self.api.s3.put_object(Bucket="test-project-uploads", Key=other, Body=b"private")
+
+        result, payload = self.project_file_action("files", token)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual([(item["name"], item["size"]) for item in payload["files"]], [("artwork.psd", 7)])
+        self.assertIsNone(payload["nextToken"])
+
+        result, payload = self.project_file_action("download", token, key=key)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("Signature", payload["url"])
+        result, _ = self.project_file_action("download", token, key=other)
+        self.assertEqual(result["statusCode"], 403)
+
+        result, payload = self.project_file_action("delete", token, key=key)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("artwork.psd", payload["message"])
+        with self.assertRaises(ClientError):
+            self.api.s3.head_object(Bucket="test-project-uploads", Key=key)
+
+    def test_project_storage_events_email_once_for_upload_and_delete(self):
+        key = "projects/Customer%20Project/20261009T120000Z-abcdef123456-artwork.psd"
+
+        def event(identifier, detail_type, size=None):
+            object_detail = {"key": key}
+            if size is not None:
+                object_detail["size"] = size
+            return {
+                "id": identifier,
+                "source": "aws.s3",
+                "detail-type": detail_type,
+                "detail": {"object": object_detail},
+            }
+
+        with patch.object(self.api, "send_project_file_notification", return_value={"MessageId": "mail"}) as send:
+            self.assertEqual(self.api.handler(event("created", "Object Created", 7), None), {"notified": True})
+            self.assertEqual(self.api.handler(event("created", "Object Created", 7), None), {"duplicate": True})
+            self.assertEqual(self.api.handler(event("deleted", "Object Deleted"), None), {"notified": True})
+            self.assertEqual(send.call_args_list[0].args, ("uploaded", "Customer Project", "artwork.psd", 7))
+            self.assertEqual(send.call_args_list[1].args, ("deleted", "Customer Project", "artwork.psd", None))
