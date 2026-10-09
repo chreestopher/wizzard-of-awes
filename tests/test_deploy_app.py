@@ -11,7 +11,8 @@ spec.loader.exec_module(app)
 class AppDeployTests(unittest.TestCase):
     def setUp(self):
         env = patch.dict(os.environ, {"STACK_NAME": "test-stack", "ARTIFACT_BUCKET": "artifacts",
-                                     "CLOUDFORMATION_ROLE_ARN": "test-role", "AWS_REGION": "us-east-1"})
+                                     "CLOUDFORMATION_ROLE_ARN": "test-role", "AWS_REGION": "us-east-1"},
+                         clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.cf, self.s3 = MagicMock(), MagicMock()
