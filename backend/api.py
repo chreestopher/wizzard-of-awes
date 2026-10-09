@@ -29,12 +29,18 @@ class RateLimitError(Exception):
 table = dynamodb.Table(os.environ["TABLE_NAME"])
 
 UPLOAD_BUCKET = os.environ["UPLOAD_BUCKET"]
+PROJECT_UPLOAD_BUCKET = os.environ.get("PROJECT_UPLOAD_BUCKET", "")
+PROJECT_UPLOAD_CODE_HASH = os.environ.get("PROJECT_UPLOAD_CODE_HASH", "")
 NOTIFICATION_EMAIL = os.environ["NOTIFICATION_EMAIL"]
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "inquiries@wizzardofawes.com")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://wizzardofawes.com")
 MAX_FILES = 5
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_DAILY_REQUESTS_PER_IP = 10
+MAX_PROJECT_FILE_BYTES = 250 * 1024 * 1024
+MAX_PROJECT_GRANT_FILES = 25
+MAX_PROJECT_ACCESS_ATTEMPTS_PER_DAY = 20
+PROJECT_ACCESS_TOKEN_SECONDS = 60 * 60
 ALLOWED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".svg",
     ".ai", ".eps", ".dxf", ".lbrn2", ".zip"
@@ -94,10 +100,10 @@ def source_ip(event):
     )
 
 
-def enforce_rate_limit(event):
+def enforce_rate_limit(event, scope="INQUIRY", limit=MAX_DAILY_REQUESTS_PER_IP):
     now = dt.datetime.now(dt.timezone.utc)
     ip_hash = hashlib.sha256(source_ip(event).encode("utf-8")).hexdigest()[:24]
-    key = f"RATE#{now.date().isoformat()}#{ip_hash}"
+    key = f"RATE#{scope}#{now.date().isoformat()}#{ip_hash}"
     try:
         table.update_item(
             Key={"pk": key},
@@ -105,7 +111,7 @@ def enforce_rate_limit(event):
             ConditionExpression="attribute_not_exists(request_count) OR request_count < :limit",
             ExpressionAttributeValues={
                 ":one": 1,
-                ":limit": MAX_DAILY_REQUESTS_PER_IP,
+                ":limit": limit,
                 ":expiry": int((now + dt.timedelta(days=2)).timestamp()),
             },
         )
@@ -113,6 +119,124 @@ def enforce_rate_limit(event):
         if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             raise RateLimitError("Too many requests. Please try again tomorrow.")
         raise
+
+
+def project_upload_enabled():
+    return bool(
+        PROJECT_UPLOAD_BUCKET
+        and re.fullmatch(r"[0-9a-fA-F]{64}", PROJECT_UPLOAD_CODE_HASH or "")
+    )
+
+
+def token_key():
+    return bytes.fromhex(PROJECT_UPLOAD_CODE_HASH)
+
+
+def encode_project_access_token(expires_at=None):
+    payload = {
+        "exp": expires_at or int(time.time()) + PROJECT_ACCESS_TOKEN_SECONDS,
+        "nonce": secrets.token_urlsafe(18),
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=")
+    signature = hmac.new(token_key(), encoded, hashlib.sha256).digest()
+    return (
+        encoded.decode("ascii")
+        + "."
+        + base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    )
+
+
+def decode_project_access_token(token):
+    try:
+        encoded_text, signature_text = str(token or "").split(".", 1)
+        encoded = encoded_text.encode("ascii")
+        signature = base64.urlsafe_b64decode(signature_text + "=" * (-len(signature_text) % 4))
+        expected = hmac.new(token_key(), encoded, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise PermissionError("Project upload access has expired. Enter the access code again.")
+        raw = base64.urlsafe_b64decode(encoded + b"=" * (-len(encoded) % 4))
+        payload = json.loads(raw)
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            raise PermissionError("Project upload access has expired. Enter the access code again.")
+        return payload
+    except PermissionError:
+        raise
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        raise PermissionError("Project upload access has expired. Enter the access code again.")
+
+
+def project_prefix(name):
+    name = text_value(name, "Project name", 100, required=True)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]*", name):
+        raise ValueError(
+            "Project name may contain letters, numbers, spaces, periods, underscores, and hyphens."
+        )
+    return f"projects/{name}"
+
+
+def authorize_project_upload(event):
+    if not project_upload_enabled():
+        return response(503, {"message": "Project uploads are not configured yet."})
+    enforce_rate_limit(
+        event, scope="PROJECTUPLOAD", limit=MAX_PROJECT_ACCESS_ATTEMPTS_PER_DAY
+    )
+    body = parse_body(event)
+    code = text_value(body.get("code"), "Access code", 200, required=True)
+    supplied_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(supplied_hash, PROJECT_UPLOAD_CODE_HASH.lower()):
+        raise PermissionError("The project upload access code is not valid.")
+    return response(200, {
+        "accessToken": encode_project_access_token(),
+        "expiresIn": PROJECT_ACCESS_TOKEN_SECONDS,
+    })
+
+
+def create_project_upload_grants(event):
+    if not project_upload_enabled():
+        return response(503, {"message": "Project uploads are not configured yet."})
+    body = parse_body(event)
+    token = text_value(body.get("accessToken"), "Access token", 2000, required=True)
+    decode_project_access_token(token)
+    prefix = project_prefix(body.get("projectName"))
+    requested_files = body.get("files") or []
+    if not isinstance(requested_files, list) or not requested_files:
+        raise ValueError("Choose at least one file.")
+    if len(requested_files) > MAX_PROJECT_GRANT_FILES:
+        raise ValueError(
+            f"Request upload grants in batches of {MAX_PROJECT_GRANT_FILES} files or fewer."
+        )
+
+    grants = []
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for requested in requested_files:
+        if not isinstance(requested, dict):
+            raise ValueError("Invalid file details.")
+        filename = safe_filename(requested.get("name"))
+        try:
+            size = int(requested.get("size") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"{filename} has an invalid file size.")
+        content_type = (
+            text_value(requested.get("type"), "File type", 120)
+            or "application/octet-stream"
+        )
+        if size < 1 or size > MAX_PROJECT_FILE_BYTES:
+            raise ValueError(f"{filename} must be 250 MiB or smaller.")
+        key = f"{prefix}/{timestamp}-{uuid.uuid4().hex[:12]}-{filename}"
+        upload = s3.generate_presigned_post(
+            Bucket=PROJECT_UPLOAD_BUCKET,
+            Key=key,
+            Fields={"Content-Type": content_type},
+            Conditions=[
+                {"Content-Type": content_type},
+                ["content-length-range", size, size],
+            ],
+            ExpiresIn=900,
+        )
+        grants.append({"name": filename, "key": key, "upload": upload})
+    return response(201, {"projectPrefix": prefix, "files": grants})
 
 
 def create_inquiry(event):
@@ -339,6 +463,10 @@ def handler(event, context):
         route_key = event.get("routeKey", "")
         if route_key == "POST /api/inquiries":
             return create_inquiry(event)
+        if route_key == "POST /api/project-upload/access":
+            return authorize_project_upload(event)
+        if route_key == "POST /api/project-upload/grants":
+            return create_project_upload_grants(event)
         match = re.fullmatch(r"POST /api/inquiries/([^/]+)/submit", route_key)
         if match:
             return submit_inquiry(event, event.get("pathParameters", {}).get("id") or match.group(1))

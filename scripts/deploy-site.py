@@ -19,14 +19,22 @@ def main():
     bucket = os.environ["SITE_BUCKET"]
     distribution = os.environ["DISTRIBUTION_ID"]
     url = os.environ["SITE_URL"].rstrip("/")
-    entries = {"app.js": "application/javascript", "styles.css": "text/css", "index.html": "text/html"}
+    asset_entries = {
+        "app.js": "application/javascript",
+        "styles.css": "text/css",
+        "project-upload.js": "application/javascript",
+        "project-upload.css": "text/css",
+    }
+    html_entries = {"index.html": "text/html", "project_upload": "text/html"}
+    entries = {**asset_entries, **html_entries}
     for name in entries:
         if not (site / name).is_file():
             raise RuntimeError(f"Missing site entry file: {name}")
 
     # Publish media before application files; excluded entries are not deleted.
-    aws("s3", "sync", str(site), f"s3://{bucket}", "--delete", "--only-show-errors",
-        "--exclude", "index.html", "--exclude", "app.js", "--exclude", "styles.css")
+    excludes = [value for name in entries for value in ("--exclude", name)]
+    aws("s3", "sync", str(site), f"s3://{bucket}", "--delete", "--only-show-errors", *excludes)
+    # Application assets must be available before either HTML entry can reference them.
     for name, content_type in entries.items():
         aws("s3", "cp", str(site / name), f"s3://{bucket}/{name}",
             "--content-type", content_type, "--cache-control", "no-cache", "--only-show-errors")

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import boto3
+import hashlib
 from botocore.exceptions import ClientError, ReadTimeoutError
 from moto import mock_aws
 
@@ -19,7 +20,9 @@ class ApiTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             "AWS_DEFAULT_REGION": "us-east-1", "TABLE_NAME": "test-inquiries",
             "UPLOAD_BUCKET": "test-uploads", "NOTIFICATION_EMAIL": "owner@example.com",
-            "FROM_EMAIL": "inquiries@example.com"})
+            "FROM_EMAIL": "inquiries@example.com",
+            "PROJECT_UPLOAD_BUCKET": "test-project-uploads",
+            "PROJECT_UPLOAD_CODE_HASH": hashlib.sha256(b"correct horse").hexdigest()})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.mock = mock_aws()
@@ -46,6 +49,21 @@ class ApiTests(unittest.TestCase):
 
     def submit(self, inquiry, token=None):
         return self.api.handler(self.event(inquiry, token), None)
+
+    def project_access(self, code="correct horse"):
+        result = self.api.handler({
+            "routeKey": "POST /api/project-upload/access",
+            "requestContext": {"http": {"sourceIp": "192.0.2.20"}},
+            "body": json.dumps({"code": code}),
+        }, None)
+        return result, json.loads(result["body"])
+
+    def project_grants(self, token, files, name="Customer Project"):
+        result = self.api.handler({
+            "routeKey": "POST /api/project-upload/grants",
+            "body": json.dumps({"accessToken": token, "projectName": name, "files": files}),
+        }, None)
+        return result, json.loads(result["body"])
 
     def test_post_policy_binds_exact_size_and_type(self):
         data = self.create([{"name": "art.png", "size": 123, "type": "image/png"}])
@@ -128,3 +146,55 @@ class ApiTests(unittest.TestCase):
 
     def test_ses_has_no_automatic_retries(self):
         self.assertEqual(self.api.ses.meta.config.retries["total_max_attempts"], 1)
+
+    def test_project_upload_requires_code_and_uses_expiring_token(self):
+        denied, _ = self.project_access("wrong")
+        self.assertEqual(denied["statusCode"], 403)
+        allowed, payload = self.project_access()
+        self.assertEqual(allowed["statusCode"], 200)
+        self.assertTrue(self.api.decode_project_access_token(payload["accessToken"])["exp"] > int(time.time()))
+        tampered = payload["accessToken"][:-1] + ("a" if payload["accessToken"][-1] != "a" else "b")
+        result, _ = self.project_grants(tampered, [{"name": "art.psd", "size": 10}])
+        self.assertEqual(result["statusCode"], 403)
+
+    def test_project_upload_policy_accepts_250_mib_and_binds_exact_size(self):
+        _, access = self.project_access()
+        size = self.api.MAX_PROJECT_FILE_BYTES
+        result, payload = self.project_grants(access["accessToken"], [{
+            "name": "source artwork.psd", "size": size, "type": "image/vnd.adobe.photoshop"
+        }])
+        self.assertEqual(result["statusCode"], 201)
+        self.assertEqual(payload["projectPrefix"], "projects/Customer Project")
+        granted = payload["files"][0]
+        self.assertTrue(granted["key"].startswith("projects/Customer Project/"))
+        policy = json.loads(base64.b64decode(granted["upload"]["fields"]["policy"]))
+        self.assertIn(["content-length-range", size, size], policy["conditions"])
+        self.assertIn({"key": granted["upload"]["fields"]["key"]}, policy["conditions"])
+
+    def test_project_upload_rejects_oversize_empty_and_unsafe_project(self):
+        _, access = self.project_access()
+        for size in (0, self.api.MAX_PROJECT_FILE_BYTES + 1):
+            with self.subTest(size=size):
+                result, _ = self.project_grants(access["accessToken"], [{"name": "file.bin", "size": size}])
+                self.assertEqual(result["statusCode"], 400)
+        result, _ = self.project_grants(
+            access["accessToken"], [{"name": "file.bin", "size": 1}], name="../../other"
+        )
+        self.assertEqual(result["statusCode"], 400)
+
+    def test_repeated_project_uploads_append_unique_keys(self):
+        _, access = self.project_access()
+        file_info = [{"name": "same-name.bin", "size": 10}]
+        _, first = self.project_grants(access["accessToken"], file_info)
+        _, second = self.project_grants(access["accessToken"], file_info)
+        self.assertNotEqual(first["files"][0]["key"], second["files"][0]["key"])
+        self.assertTrue(first["files"][0]["key"].startswith(second["projectPrefix"] + "/"))
+
+    def test_project_grant_batch_has_no_file_type_restriction_but_is_bounded(self):
+        _, access = self.project_access()
+        files = [{"name": f"file-{index}.unusual", "size": 1} for index in range(self.api.MAX_PROJECT_GRANT_FILES)]
+        result, payload = self.project_grants(access["accessToken"], files)
+        self.assertEqual(result["statusCode"], 201)
+        self.assertEqual(len(payload["files"]), self.api.MAX_PROJECT_GRANT_FILES)
+        result, _ = self.project_grants(access["accessToken"], files + [{"name": "one-more", "size": 1}])
+        self.assertEqual(result["statusCode"], 400)

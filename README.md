@@ -8,6 +8,7 @@ Serverless gallery and private project-inquiry website for **WizzardOfAwes.com**
 - A contact form for business-card and custom-project inquiries.
 - Direct, private browser uploads to Amazon S3.
 - Seven-day automatic deletion for inquiry files and records.
+- A code-protected `/project_upload` portal for durable project file transfers.
 - Email notifications through Amazon SES using `inquiries@wizzardofawes.com`.
 - CloudFront, private S3 origins, API Gateway, Lambda, DynamoDB, Route 53, ACM, and SES managed as one CloudFormation stack.
 
@@ -57,11 +58,39 @@ Use the following command for initial provisioning or administrator-led recovery
 ./scripts/Deploy-WizzardOfAwesSite.ps1 -Profile mopa-admin
 ```
 
+The project-upload access code is never stored in this repository. Hash the chosen
+code locally and save only its SHA-256 digest as the Actions secret
+`PROJECT_UPLOAD_CODE_HASH`:
+
+```powershell
+$code = Read-Host 'Project upload access code' -AsSecureString
+$plain = [System.Net.NetworkCredential]::new('', $code).Password
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
+$digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+$plain = $null
+gh secret set PROJECT_UPLOAD_CODE_HASH --body $digest
+```
+
+The workflow supplies that digest as a masked CloudFormation parameter. If the
+secret is absent during the first deployment, the page is published but access
+returns a configuration error until a later deployment supplies the digest. Manual
+recovery deployments may pass `-ProjectUploadCodeHash $digest`.
+
 The first deployment creates the hosted zone, certificate, serverless services, DNS records, and SES domain identity. If the AWS account is still in the SES sandbox, AWS may send a one-time verification message to the private notification address before inquiry emails can be delivered.
 
 ## Upload policy
 
 Inquiry files are private, encrypted at rest, limited to five files of 10 MiB each (shown as 10 MB in the form), and removed after seven days. Notification emails contain expiring private download links instead of attaching untrusted uploads directly.
+
+Project-portal files use a separate private, encrypted, retained bucket. Each file
+may be at most 250 MiB, there is no application-level file-count limit, and completed
+files have no expiration lifecycle. A project name maps to an S3 prefix; later
+uploads with the same name receive unique object keys under that prefix, so they
+append without replacing earlier files. New names begin a new prefix when their
+first file is uploaded. Files remain until an administrator deletes them from S3.
+The access code is verified by Lambda, never shipped to the browser, and successful
+verification produces a one-hour in-memory token. Upload grants last 15 minutes and
+bind the exact declared content length and content type.
 
 ## Payments
 

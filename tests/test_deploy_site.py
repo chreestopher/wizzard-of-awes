@@ -28,9 +28,18 @@ class DeployTests(unittest.TestCase):
             deploy.main()
         calls = [c.args for c in aws.call_args_list]
         uploads = [c for c in calls if c[:2] == ('s3', 'cp')]
-        self.assertTrue(uploads[-1][2].endswith('index.html'))
+        self.assertTrue(uploads[-1][2].endswith('project_upload'))
+        self.assertTrue(uploads[-2][2].endswith('index.html'))
+        self.assertIn('text/html', uploads[-1])
         self.assertEqual(calls[-1][:3], ('cloudfront', 'wait', 'invalidation-completed'))
-        self.assertEqual(live.call_count, 3)
+        self.assertEqual(live.call_count, 6)
+
+    def test_project_upload_page_has_external_script_and_unlimited_picker(self):
+        page = (root / 'site' / 'project_upload').read_text(encoding='utf-8')
+        self.assertIn('src="/project-upload.js"', page)
+        self.assertNotIn('<script>', page)
+        self.assertIn('type="file" multiple', page)
+        self.assertIn('up to 250 MiB per file', page)
 
     def test_failed_upload_stops_deployment(self):
         with patch.object(deploy, 'aws', side_effect=subprocess.CalledProcessError(1, 'aws')) as aws, patch.object(deploy, 'urlopen') as live:
