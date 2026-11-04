@@ -61,6 +61,57 @@ async function checkImage(page, selector, native) {
   assert.equal(await page.evaluate(() => document.documentElement.classList.contains('image-fullscreen-open')), false);
 }
 
+async function checkVideo(page, selector, checkObserver = false) {
+  const container = page.locator(selector).first();
+  const video = container.locator('video');
+  await container.locator(':scope > button').click();
+  await page.waitForFunction(() => !!document.fullscreenElement);
+  await page.waitForFunction(video => !video.paused && video.readyState >= 2 && video.parentElement.querySelector('.video-poster').hidden, await video.elementHandle());
+  assert.equal(await video.evaluate(video => getComputedStyle(video).objectFit), 'contain');
+  assert.equal(await container.locator('.video-poster').evaluate(poster => getComputedStyle(poster).display), 'none', 'Fullscreen must not uncover the still poster over the playing video');
+  if (checkObserver) {
+    const state = await page.evaluate(() => {
+      const active = document.fullscreenElement.querySelector('video');
+      const other = [...document.querySelectorAll('video')].find(video => video !== active);
+      // Reproduce queued offscreen/competing-card notifications during fullscreen.
+      window.testVideoIntersection([
+        { target: active, isIntersecting: false },
+        { target: other, isIntersecting: true },
+      ]);
+      return { activePaused: active.paused, otherPaused: other.paused };
+    });
+    assert.deepEqual(state, { activePaused: false, otherPaused: true }, 'Gallery autoplay must leave the fullscreen video playing');
+  }
+  const start = await video.evaluate(video => video.currentTime);
+  await page.waitForFunction(({ video, start }) => !video.paused && Math.abs(video.currentTime - start) > 0.1, { video: await video.elementHandle(), start });
+  await container.locator(':scope > button').click();
+  await page.waitForFunction(() => !document.fullscreenElement);
+  if (checkObserver) {
+    const states = await video.evaluate(active => {
+      const other = [...document.querySelectorAll('video')].find(video => video !== active);
+      const notify = () => window.testVideoIntersection([
+        { target: active, isIntersecting: false },
+        { target: other, isIntersecting: true },
+      ]);
+      const snapshot = () => ({ activePaused: active.paused, otherPaused: other.paused });
+      notify();
+      const afterExit = snapshot();
+      // Safari's native video viewer emits video events instead of document fullscreenchange.
+      active.dispatchEvent(new Event('webkitbeginfullscreen'));
+      notify();
+      const nativeBegin = snapshot();
+      active.dispatchEvent(new Event('webkitendfullscreen'));
+      notify();
+      return { afterExit, nativeBegin, nativeEnd: snapshot() };
+    });
+    assert.deepEqual(states, {
+      afterExit: { activePaused: true, otherPaused: false },
+      nativeBegin: { activePaused: false, otherPaused: true },
+      nativeEnd: { activePaused: true, otherPaused: false },
+    }, 'Autoplay must respect native video fullscreen and resume normally after exit');
+  }
+}
+
 (async () => {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${server.address().port}`;
@@ -82,12 +133,9 @@ async function checkImage(page, selector, native) {
         await page.waitForFunction(() => document.querySelector('.pen-item picture > button').textContent === 'Exit fullscreen');
         await page.evaluate(() => document.exitFullscreen());
         await page.waitForFunction(() => !document.querySelector('.image-fullscreen-dialog').open && !document.documentElement.classList.contains('image-fullscreen-open'));
-        // Existing video controls still use native fullscreen and contain sizing.
-        await page.locator('.work-card-media:has(video) > button').first().click();
-        await page.waitForFunction(() => !!document.fullscreenElement);
-        assert.equal(await page.evaluate(() => getComputedStyle(document.fullscreenElement.querySelector('video')).objectFit), 'contain');
-        await page.locator('.work-card-media:has(video) > button').first().click();
-        await page.waitForFunction(() => !document.fullscreenElement);
+        // Check actual frame advancement and poster visibility, not only sizing.
+        await checkVideo(page, '.work-card-media:has(video)');
+        await checkVideo(page, '.gallery-media');
         for (const mode of ['missing', 'rejected']) {
           await page.evaluate(mode => {
             Element.prototype.requestFullscreen = mode === 'missing' ? undefined : () => Promise.reject(new Error('Denied'));
@@ -102,6 +150,20 @@ async function checkImage(page, selector, native) {
         console.log(`PASS ${name} ${viewport.width}x${viewport.height}: images, video, native exit, missing/denied API, Escape, focus, sizing`);
         await page.close();
       }
+      const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, reducedMotion: 'no-preference' });
+      await page.addInitScript(() => {
+        const NativeObserver = window.IntersectionObserver;
+        window.IntersectionObserver = class extends NativeObserver {
+          constructor(callback, options) {
+            super(callback, options);
+            window.testVideoIntersection = callback;
+          }
+        };
+      });
+      await page.goto(url);
+      await checkVideo(page, '.gallery-media', true);
+      console.log(`PASS ${name}: fullscreen playback survives competing autoplay notifications`);
+      await page.close();
     } finally { await browser.close(); }
   }
   const browser = await webkit.launch({ headless: true });
