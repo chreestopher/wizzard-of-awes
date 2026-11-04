@@ -53,6 +53,7 @@ window.addEventListener("load", () => {
 const fullscreenMedia = document.querySelectorAll(
   ".work-card-media--duo picture, .work-card > .work-card-media:not(.work-card-media--duo), .pen-item picture, .woodwork-item picture, .gallery-media"
 );
+let fullscreenVideo = null;
 
 // A modal keeps the image usable when a mobile browser cannot fullscreen HTML.
 // Fullscreen the inner div: the Fullscreen API does not accept dialog elements.
@@ -158,11 +159,14 @@ async function toggleFullscreen(container) {
 
     const requestFullscreen = container.requestFullscreen || container.webkitRequestFullscreen;
     if (requestFullscreen) {
+      setFullscreenVideo(video);
       await requestFullscreen.call(container);
     } else if (video?.webkitEnterFullscreen) {
+      setFullscreenVideo(video);
       video.webkitEnterFullscreen();
     }
   } catch (error) {
+    setFullscreenVideo(null);
     console.warn("Fullscreen could not be opened.", error);
   }
 }
@@ -192,6 +196,8 @@ galleryVideos.forEach((video) => {
   video.parentElement.append(poster);
   video.addEventListener("playing", () => { poster.hidden = true; });
   video.addEventListener("emptied", () => { poster.hidden = false; });
+  video.addEventListener("webkitbeginfullscreen", () => setFullscreenVideo(video));
+  video.addEventListener("webkitendfullscreen", () => setFullscreenVideo(null));
 });
 
 function loadGalleryVideo(video) {
@@ -202,10 +208,30 @@ function loadGalleryVideo(video) {
   }
 }
 
+function setFullscreenVideo(video) {
+  fullscreenVideo = video;
+  if (!video) return;
+  galleryVideos.forEach((other) => {
+    if (other !== video) other.pause();
+  });
+  loadGalleryVideo(video);
+  video.play().catch(() => {});
+}
+
+function syncFullscreenVideo() {
+  const active = activeFullscreenElement();
+  setFullscreenVideo(active?.matches("video") ? active : active?.querySelector("video") || null);
+}
+document.addEventListener("fullscreenchange", syncFullscreenVideo);
+document.addEventListener("webkitfullscreenchange", syncFullscreenVideo);
+
 if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
   galleryVideos.forEach((video) => video.pause());
 } else {
   const videoObserver = new IntersectionObserver((entries) => {
+    // Fullscreen layout changes can queue offscreen entries or reveal another
+    // card. Only the fullscreen video owns playback until the viewer exits.
+    if (fullscreenVideo) return;
     entries.forEach((entry) => {
       if (entry.isIntersecting) {
         galleryVideos.forEach((video) => {
